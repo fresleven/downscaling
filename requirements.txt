@@ -1,0 +1,15 @@
+numpy
+matplotlib
+rasterio
+geopandas
+fiona
+shapely
+pyproj
+pyhdf
+scipy
+scikit-learn
+torch
+torchvision
+xarray
+rioxarray
+gdown

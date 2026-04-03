@@ -1,3 +1,6 @@
+# Data files (downloaded from Google Drive, too large for git)
+data/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
