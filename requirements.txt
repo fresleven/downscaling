@@ -12,4 +12,4 @@ torch
 torchvision
 xarray
 rioxarray
-gdown
+huggingface_hub
