@@ -8,6 +8,7 @@ Machine learning models for downscaling MODIS Land Surface Temperature over the 
 |----------|-------------|
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/fresleven/downscaling/blob/main/main.ipynb) | `main.ipynb` — Main pipeline |
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/fresleven/downscaling/blob/main/explore_data.ipynb) | `explore_data.ipynb` — Data exploration & visualization |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/fresleven/downscaling/blob/main/baselines.ipynb) | `baselines.ipynb` — BCSD & Lasso downscaling baselines (5km → 1km) |
 
 ## Dataset
 
