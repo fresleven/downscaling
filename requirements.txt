@@ -5,7 +5,7 @@ geopandas
 fiona
 shapely
 pyproj
-pyhdf
+h5py
 scipy
 scikit-learn
 torch
@@ -13,3 +13,4 @@ torchvision
 xarray
 rioxarray
 huggingface_hub
+torchgeo

@@ -1,33 +1,43 @@
 """
-Attention-Augmented CNN for temperature downscaling.
+Attention-Augmented CNN for guided LST downscaling (4 km → 1 km).
 
-Architecture (from Section 4 of the project proposal):
-  - Residual super-resolution backbone with dual attention
-    (Channel Attention + Spatial Attention) in feature extraction blocks
-  - Progressive upsampling via PixelShuffle: 1km -> 500m -> 250m (2x each stage)
-  - Spatial attention reapplied after each upsampling stage
+Architecture:
+  - LR branch: feature extraction on the 4 km LST input through residual
+    blocks with channel + spatial attention.
+  - HR branch: feature extraction on the 1 km guidance covariates
+    (NDVI + DEM + LULC one-hot) — same residual+attention design.
+  - Fusion: bilinear-upsample LR features to the HR grid, concatenate with
+    HR features, refine with a stack of attention-augmented residual blocks
+    at HR resolution.
+  - Output: predict the *residual* on top of a bicubic-upsampled LR baseline.
+    The network only has to learn the high-frequency correction; the low-
+    frequency component is preserved by construction. Standard EDSR pattern.
 
-Input channels (concatenated at 1km):
-  - Coarsened MODIS LST (bicubic-upsampled from 5km)  : 1 ch
-  - DEM elevation                                      : 1 ch
-  - DEM slope                                          : 1 ch
-  - DEM aspect                                         : 1 ch
-  - Sentinel-2 NDVI                                    : 1 ch
-  - Sentinel-2 NDWI                                    : 1 ch
-  - NLCD land cover (one-hot or embedded)               : N ch
-                                                  Total: 6 + N
-Output: 1-channel temperature field at 1km (5x spatial dimensions of input)
+Inputs at forward time:
+  lr_lst   (B, 1, h, w)        LR LST at 4 km                  (e.g. 28x22)
+  hr_cov   (B, C, H, W)        HR covariate stack at 1 km      (e.g. 112x87)
+                               channel order is up to the caller; suggested:
+                               [NDVI(1), DEM(1), LULC_onehot(N)]
+Output:
+  hr_pred  (B, 1, H, W)        predicted HR LST at 1 km
 """
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
+
+# ---------------------------------------------------------------------------
+# Attention modules
+# ---------------------------------------------------------------------------
 
 class ChannelAttention(nn.Module):
-    """Squeeze-and-Excitation style channel attention (SE block).
+    """Squeeze-and-Excitation channel attention.
 
-    Recalibrates inter-channel feature responses so the network can
-    prioritize, e.g., DEM in alpine zones or NDVI over forests.
+    Recalibrates inter-channel responses so the network can prioritize, e.g.,
+    DEM in alpine zones or NDVI over forest, conditional on the input.
     """
 
     def __init__(self, channels: int, reduction: int = 16):
@@ -49,12 +59,7 @@ class ChannelAttention(nn.Module):
 
 
 class SpatialAttention(nn.Module):
-    """Spatial attention via channel-wise pooling + conv.
-
-    Produces a learned spatial mask that focuses representational power
-    on high-frequency terrain features (ridges, shadow boundaries) rather
-    than homogeneous background.
-    """
+    """Spatial attention via channel-pooled conv mask."""
 
     def __init__(self, kernel_size: int = 7):
         super().__init__()
@@ -72,7 +77,7 @@ class SpatialAttention(nn.Module):
 
 
 class AttentionResBlock(nn.Module):
-    """Residual block augmented with channel + spatial attention."""
+    """Residual block with dual (channel + spatial) attention."""
 
     def __init__(self, channels: int):
         super().__init__()
@@ -94,81 +99,84 @@ class AttentionResBlock(nn.Module):
         return self.relu(out + x)
 
 
-class UpsampleStage(nn.Module):
-    """5x upsampling via PixelShuffle + spatial attention.
-
-    Spatial attention is reapplied after upsampling to preserve
-    terrain-driven temperature gradients at the finer resolution.
-    """
-
-    def __init__(self, in_channels: int, out_channels: int, scale: int = 5):
-        super().__init__()
-        # PixelShuffle(r) needs r^2 × out_channels
-        self.conv = nn.Conv2d(in_channels, out_channels * scale ** 2, 3, padding=1)
-        self.shuffle = nn.PixelShuffle(scale)
-        self.sa = SpatialAttention()
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.relu(self.shuffle(self.conv(x)))
-        out = self.sa(out)
-        return out
-
+# ---------------------------------------------------------------------------
+# Main model
+# ---------------------------------------------------------------------------
 
 class AttentionAugmentedCNN(nn.Module):
-    """Attention-Augmented CNN for progressive temperature downscaling.
+    """Guided super-resolution CNN with dual attention.
 
     Args:
-        in_channels:  Number of input channels (LST + covariates).
-        base_channels: Width of the feature extraction backbone.
-        num_res_blocks: Number of attention-augmented residual blocks.
-        scale_factor: Upsampling factor (5 = 5km -> 1km).
+        cov_channels:    number of HR-covariate channels (NDVI + DEM + LULC one-hot).
+        base_channels:   feature width.
+        n_lr_blocks:     residual blocks at LR resolution.
+        n_hr_blocks:     residual blocks at HR resolution after fusion.
     """
 
     def __init__(
         self,
-        in_channels: int = 6,
+        cov_channels: int,
         base_channels: int = 64,
-        num_res_blocks: int = 8,
-        scale_factor: int = 5,
+        n_lr_blocks: int = 4,
+        n_hr_blocks: int = 6,
     ):
         super().__init__()
 
-        # --- Head: project input covariates into feature space ---
-        self.head = nn.Sequential(
-            nn.Conv2d(in_channels, base_channels, 3, padding=1),
+        # --- LR branch (operates on the 4 km LST) ---
+        self.lr_head = nn.Sequential(
+            nn.Conv2d(1, base_channels, 3, padding=1),
             nn.ReLU(inplace=True),
         )
-
-        # --- Body: stack of attention-augmented residual blocks ---
-        self.body = nn.Sequential(
-            *[AttentionResBlock(base_channels) for _ in range(num_res_blocks)]
+        self.lr_body = nn.Sequential(
+            *[AttentionResBlock(base_channels) for _ in range(n_lr_blocks)]
         )
-        # Global skip connection conv (long residual)
-        self.body_tail = nn.Conv2d(base_channels, base_channels, 3, padding=1)
 
-        # --- Upsampling: 5x via PixelShuffle (5km -> 1km) ---
-        self.upsample = UpsampleStage(base_channels, base_channels, scale=scale_factor)
+        # --- HR branch (operates on covariates at 1 km) ---
+        self.hr_head = nn.Sequential(
+            nn.Conv2d(cov_channels, base_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.hr_body = nn.Sequential(
+            *[AttentionResBlock(base_channels) for _ in range(n_lr_blocks)]
+        )
 
-        # --- Tail: map back to single temperature channel ---
+        # --- Fusion + HR refinement ---
+        self.fuse = nn.Conv2d(2 * base_channels, base_channels, 1)
+        self.refine = nn.Sequential(
+            *[AttentionResBlock(base_channels) for _ in range(n_hr_blocks)]
+        )
         self.tail = nn.Conv2d(base_channels, 1, 3, padding=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, lr_lst: torch.Tensor, hr_cov: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            x: (B, in_channels, H, W) tensor at 5km resolution.
-               Channel order: [LST_coarse, DEM, slope, aspect, NDVI, NDWI, ...]
-
-        Returns:
-            (B, 1, H*5, W*5) downscaled temperature at 1km.
+        lr_lst : (B, 1, h, w)
+        hr_cov : (B, C, H, W)
+        returns: (B, 1, H, W)
         """
-        head = self.head(x)
+        H, W = hr_cov.shape[-2:]
 
-        # Deep feature extraction with global residual
-        body = self.body(head)
-        body = self.body_tail(body) + head
+        # Bicubic baseline — guarantees the network preserves low-freq content.
+        baseline = F.interpolate(lr_lst, size=(H, W), mode="bicubic", align_corners=False)
 
-        # Upsampling: 5km -> 1km
-        up = self.upsample(body)
+        # LR feature path
+        f_lr = self.lr_body(self.lr_head(lr_lst))
+        f_lr_up = F.interpolate(f_lr, size=(H, W), mode="bilinear", align_corners=False)
 
-        return self.tail(up)
+        # HR feature path
+        f_hr = self.hr_body(self.hr_head(hr_cov))
+
+        # Fuse and refine at HR
+        fused = self.fuse(torch.cat([f_lr_up, f_hr], dim=1))
+        refined = self.refine(fused)
+        delta = self.tail(refined)
+
+        return baseline + delta
+
+
+# ---------------------------------------------------------------------------
+# Convenience: assemble HR covariate tensor from a dataset batch
+# ---------------------------------------------------------------------------
+
+def make_hr_cov(batch: dict) -> torch.Tensor:
+    """Standard HR-covariate stacking: [NDVI, DEM, LULC one-hot] → (B, C, H, W)."""
+    return torch.cat([batch["ndvi"], batch["dem"], batch["lulc_onehot"]], dim=1)
