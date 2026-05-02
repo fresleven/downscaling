@@ -3,7 +3,7 @@ Attention-Augmented CNN for guided LST downscaling (4 km → 1 km).
 
 Architecture:
   - LR branch: feature extraction on the 4 km LST input through residual
-    blocks with channel + spatial attention.
+    blocks with channel attention + full spatial self-attention.
   - HR branch: feature extraction on the 1 km guidance covariates
     (NDVI + DEM + LULC one-hot) — same residual+attention design.
   - Fusion: bilinear-upsample LR features to the HR grid, concatenate with
@@ -12,6 +12,10 @@ Architecture:
   - Output: predict the *residual* on top of a bicubic-upsampled LR baseline.
     The network only has to learn the high-frequency correction; the low-
     frequency component is preserved by construction. Standard EDSR pattern.
+
+Spatial attention is full multi-head self-attention over all H×W positions
+(no masking). With block-as-sample, HR blocks are ~22×14 ≈ 300 tokens and LR
+scenes are ~28×22 ≈ 600 tokens — both small enough for dense attention.
 
 Inputs at forward time:
   lr_lst   (B, 1, h, w)        LR LST at 4 km                  (e.g. 28x22)
@@ -58,28 +62,31 @@ class ChannelAttention(nn.Module):
         return x * w
 
 
-class SpatialAttention(nn.Module):
-    """Spatial attention via channel-pooled conv mask."""
+class SpatialSelfAttention(nn.Module):
+    """Full multi-head self-attention over all spatial positions (H*W tokens).
 
-    def __init__(self, kernel_size: int = 7):
+    Each pixel attends to every other pixel in the feature map. Pre-norm
+    with an additive residual — standard transformer block style.
+    """
+
+    def __init__(self, channels: int, num_heads: int = 8):
         super().__init__()
-        pad = kernel_size // 2
-        self.conv = nn.Sequential(
-            nn.Conv2d(2, 1, kernel_size, padding=pad, bias=False),
-            nn.Sigmoid(),
-        )
+        self.norm = nn.LayerNorm(channels)
+        self.attn = nn.MultiheadAttention(channels, num_heads, batch_first=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        avg = x.mean(dim=1, keepdim=True)
-        mx, _ = x.max(dim=1, keepdim=True)
-        w = self.conv(torch.cat([avg, mx], dim=1))
-        return x * w
+        B, C, H, W = x.shape
+        seq = x.flatten(2).permute(2, 0, 1)        # (H*W, B, C)
+        normed = self.norm(seq)
+        attn_out, _ = self.attn(normed, normed, normed)
+        attn_out = attn_out.permute(1, 2, 0).view(B, C, H, W)
+        return x + attn_out
 
 
 class AttentionResBlock(nn.Module):
-    """Residual block with dual (channel + spatial) attention."""
+    """Residual block with channel attention then full spatial self-attention."""
 
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, num_heads: int = 8):
         super().__init__()
         self.body = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, bias=False),
@@ -89,7 +96,7 @@ class AttentionResBlock(nn.Module):
             nn.BatchNorm2d(channels),
         )
         self.ca = ChannelAttention(channels)
-        self.sa = SpatialAttention()
+        self.sa = SpatialSelfAttention(channels, num_heads)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -119,32 +126,30 @@ class AttentionAugmentedCNN(nn.Module):
         base_channels: int = 64,
         n_lr_blocks: int = 4,
         n_hr_blocks: int = 6,
+        num_heads: int = 8,
     ):
         super().__init__()
+
+        def _block():
+            return AttentionResBlock(base_channels, num_heads)
 
         # --- LR branch (operates on the 4 km LST) ---
         self.lr_head = nn.Sequential(
             nn.Conv2d(1, base_channels, 3, padding=1),
             nn.ReLU(inplace=True),
         )
-        self.lr_body = nn.Sequential(
-            *[AttentionResBlock(base_channels) for _ in range(n_lr_blocks)]
-        )
+        self.lr_body = nn.Sequential(*[_block() for _ in range(n_lr_blocks)])
 
         # --- HR branch (operates on covariates at 1 km) ---
         self.hr_head = nn.Sequential(
             nn.Conv2d(cov_channels, base_channels, 3, padding=1),
             nn.ReLU(inplace=True),
         )
-        self.hr_body = nn.Sequential(
-            *[AttentionResBlock(base_channels) for _ in range(n_lr_blocks)]
-        )
+        self.hr_body = nn.Sequential(*[_block() for _ in range(n_lr_blocks)])
 
         # --- Fusion + HR refinement ---
         self.fuse = nn.Conv2d(2 * base_channels, base_channels, 1)
-        self.refine = nn.Sequential(
-            *[AttentionResBlock(base_channels) for _ in range(n_hr_blocks)]
-        )
+        self.refine = nn.Sequential(*[_block() for _ in range(n_hr_blocks)])
         self.tail = nn.Conv2d(base_channels, 1, 3, padding=1)
 
     def forward(self, lr_lst: torch.Tensor, hr_cov: torch.Tensor) -> torch.Tensor:

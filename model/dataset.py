@@ -8,36 +8,43 @@ Reads the post-2026-04 layout of `akhot2/downscaling`:
         NDVI/         MOD13Q1.A*.h09v05.061.*_cropped.hdf   (HDF5; 347 m, 16-day)
         DEM/          dem_aoi_{4km,1km,250m}.tif + dem_aoi.tif (native ~30 m)
         LULC_final.tiff      30 m, single-layer, Albers AEA
+        stations/     final_stations.csv  (lat/lon of validation stations)
         aoi/colorado_bbox.shp
 
-Reference grids:
-    HR  = DEM 1 km grid (112, 87) in EPSG:32613.
-    LR  = DEM 4 km grid (28, 22)  in EPSG:32613.
+Supported resolution pairs (lr_res → hr_res):
+    "4km" → "1km"   standard task; 4x upscaling
+    "1km" → "250m"  finer task; 4x upscaling
+    (any combination of "4km", "1km", "250m" is accepted)
 
-Each sample (one date):
-    lr_lst       (1, 28, 22)   °C   coarsened MODIS LST_Day_1km @ 4 km
-    hr_lst       (1, 112, 87)  °C   MODIS LST_Day_1km @ 1 km          ← target
-    ndvi         (1, 112, 87)  -    MOD13Q1 NDVI nearest composite, 1 km
-    dem          (1, 112, 87)  m    static
-    lulc         (1, 112, 87)  cls  static, NLCD 2022 land-cover class
-    lulc_onehot  (N, 112, 87)  float one-hot of `lulc` over classes present in the AOI
-    data_mask    (1, 112, 87)  bool finite LST (cloud/QC mask only)
-    valid_mask   (1, 112, 87)  bool data_mask AND in this split's spatial blocks
-    date         str           ISO yyyy-mm-dd
+NOTE: MODIS LST is natively 1 km. For hr_res="250m" the target is bilinearly
+interpolated from 1 km — not a true 250 m measurement. Swap in Landsat/ASTER
+thermal data when you have it.
 
-`N` (LULC class count) is detected from the AOI at init and exposed as
-`dataset.lulc_classes` (sorted list of class codes).
+Each sample is one (date, spatial-block) pair:
+    lr_lst       (1, LR_H, LR_W)   full LR scene at lr_res
+    hr_lst       (1, bH, bW)        HR target cropped to this block at hr_res
+    ndvi         (1, bH, bW)        nearest NDVI composite, reprojected to hr_res
+    dem          (1, bH, bW)        static DEM at hr_res
+    lulc         (1, bH, bW)        NLCD class at hr_res
+    lulc_onehot  (N, bH, bW)        one-hot over AOI-present classes
+    loc          (2, bH, bW)        normalized UTM (x, y) ∈ [0, 1] for each pixel
+    data_mask    (1, bH, bW)        finite LST
+    valid_mask   (1, bH, bW)        data_mask AND not a station holdout pixel
+    date         str                ISO yyyy-mm-dd
+    block_id     int
 
-Splits combine a temporal block (train=Jan–Sep'22, val=Oct–Dec'22, test=2023)
-with a spatial holdout: the AOI is divided into BLOCK_GRID coarse blocks,
-stratified by (urban-frac × elevation), and ~60/20/20 of blocks go to
-train/val/test. `valid_mask` restricts the loss to each split's own blocks
-so val/test pixels are spatially disjoint from train pixels — this defeats
-spatial autocorrelation while keeping urban + rural coverage in every split.
+Splits:
+  Temporal — train: Jan–Sep 2022, val: Oct–Dec 2022, test: 2023.
+  Spatial  — the HR AOI is divided into BLOCK_GRID coarse blocks, stratified by
+             (urban-frac × elevation), ~60/20/20 to train/val/test.
+  Stations — blocks containing any station from `stations/final_stations.csv`
+             are dropped from the training split entirely. Val/test keep them
+             so they can be used for point-based evaluation.
 """
 
 from __future__ import annotations
 
+import csv
 import os
 import re
 import glob
@@ -50,8 +57,9 @@ import h5py
 import numpy as np
 import rasterio
 import torch
+from pyproj import Transformer
 from rasterio.warp import reproject, Resampling
-from rasterio.transform import Affine
+from rasterio.transform import Affine, rowcol
 from torch.utils.data import Dataset, DataLoader
 
 warnings.filterwarnings("ignore", category=rasterio.errors.NotGeoreferencedWarning)
@@ -61,25 +69,25 @@ warnings.filterwarnings("ignore", category=rasterio.errors.NotGeoreferencedWarni
 # Constants
 # ---------------------------------------------------------------------------
 
-REF_CRS = "EPSG:32613"  # UTM 13N — every gridded layer lives here
+REF_CRS = "EPSG:32613"  # UTM 13N
+
 SPLIT_RANGES = {
     "train": (datetime(2022, 1, 1), datetime(2022, 9, 30)),
     "val":   (datetime(2022, 10, 1), datetime(2022, 12, 31)),
     "test":  (datetime(2023, 1, 1), datetime(2023, 12, 31)),
 }
-SPLIT_IDX = {"train": 0, "val": 1, "test": 2}
 
-# 5×6 coarse block grid over the HR (112, 87) AOI: 30 blocks of ~22×15 km.
-# Bigger than LST spatial autocorrelation (~5–15 km) so adjacent val/train
-# blocks aren't redundant; small enough that 60/20/20 = 18/6/6 leaves enough
-# blocks per split for stratified urban+rural sampling to balance out.
+# DEM filename for each supported resolution label
+RESOLUTION_DEMS = {
+    "4km":  "dem_aoi_4km.tif",
+    "1km":  "dem_aoi_1km.tif",
+    "250m": "dem_aoi_250m.tif",
+}
+
+# 5×6 coarse block grid — 30 blocks, each ~4× the LST autocorrelation length.
 BLOCK_GRID = (5, 6)
 
-# NLCD developed classes — anything starting with "Developed" (legend codes 21–24
-# in legacy NLCD; 22–25 in NLCD Annual). We treat ≥21 and <30 as "urban".
 URBAN_LULC_RANGE = (21, 30)
-
-# DEM/LULC nodata sentinels in the source rasters
 LULC_NODATA = 250
 
 
@@ -93,7 +101,6 @@ def _modis_date(filename: str) -> datetime:
 
 
 def _read_h5_layer(path: str, layer: str) -> tuple[np.ndarray, Affine, str]:
-    """Read an HDF5 layer + its rasterio transform/CRS attrs."""
     with h5py.File(path, "r") as h:
         ds = h[layer]
         arr = ds[:]
@@ -106,14 +113,9 @@ def _read_h5_layer(path: str, layer: str) -> tuple[np.ndarray, Affine, str]:
 
 
 def read_modis_lst(path: str, layer: str = "LST_Day_1km") -> tuple[np.ndarray, Affine]:
-    """Return (LST in Celsius with NaNs, src transform). Applies QC filter."""
     raw, tf, _ = _read_h5_layer(path, layer)
-    qc_layer = "QC_Day" if "Day" in layer else "QC_Night"
-    qc, _, _ = _read_h5_layer(path, qc_layer)
-    valid = (raw >= 7500) & (raw <= 65535)
-    mandatory = qc & 0b11
-    quality = (mandatory == 0) | (mandatory == 1)
-    lst = np.where(valid & quality, raw.astype(np.float32) * 0.02 - 273.15, np.nan)
+    valid = (raw >= 7500) & (raw <= 65535)  # MODIS fill-value mask only
+    lst = np.where(valid, raw.astype(np.float32) * 0.02 - 273.15, np.nan)
     return lst.astype(np.float32), tf
 
 
@@ -134,7 +136,6 @@ def reproject_to(
     resampling: Resampling = Resampling.bilinear,
     nodata: float = np.nan,
 ) -> np.ndarray:
-    """Reproject a 2-D array onto a target grid."""
     dst = np.full(dst_shape, nodata, dtype=np.float32)
     reproject(
         source=src_arr.astype(np.float32),
@@ -151,11 +152,10 @@ def reproject_to(
 
 
 # ---------------------------------------------------------------------------
-# Spatial split
+# Spatial split helpers
 # ---------------------------------------------------------------------------
 
 def build_block_grid(hr_shape: tuple[int, int], grid: tuple[int, int]) -> np.ndarray:
-    """Return (H, W) int array labeling each HR pixel with its block id."""
     H, W = hr_shape
     rows, cols = grid
     block_id = np.zeros((H, W), dtype=np.int32)
@@ -173,12 +173,6 @@ def assign_blocks_to_splits(
     dem_hr: np.ndarray,
     seed: int = 42,
 ) -> dict[int, str]:
-    """Assign each block to train/val/test, stratified by urban-frac × elevation.
-
-    Within each stratum we shuffle deterministically and take 60/20/20 of the
-    blocks. This guarantees urban and rural blocks are present in every split,
-    while keeping val/test spatially disjoint from train.
-    """
     rng = np.random.default_rng(seed)
     n_blocks = int(block_id.max()) + 1
 
@@ -193,8 +187,8 @@ def assign_blocks_to_splits(
         elev_mean[b] = np.nanmean(dem_hr[m])
 
     urban_hi = urban_frac > np.median(urban_frac)
-    elev_hi = elev_mean > np.median(elev_mean)
-    strata = urban_hi.astype(int) * 2 + elev_hi.astype(int)  # 0..3
+    elev_hi   = elev_mean  > np.median(elev_mean)
+    strata = urban_hi.astype(int) * 2 + elev_hi.astype(int)
 
     assignment: dict[int, str] = {}
     for s in range(4):
@@ -203,8 +197,8 @@ def assign_blocks_to_splits(
             continue
         rng.shuffle(members)
         n = len(members)
-        n_val = max(1, int(round(n * 0.20)))
-        n_test = max(1, int(round(n * 0.20)))
+        n_val   = max(1, int(round(n * 0.20)))
+        n_test  = max(1, int(round(n * 0.20)))
         n_train = n - n_val - n_test
         for b in members[:n_train]:
             assignment[int(b)] = "train"
@@ -212,18 +206,9 @@ def assign_blocks_to_splits(
             assignment[int(b)] = "val"
         for b in members[n_train + n_val:]:
             assignment[int(b)] = "test"
-    # Any block we missed (none expected): default to train
     for b in range(n_blocks):
         assignment.setdefault(b, "train")
     return assignment
-
-
-def build_spatial_mask(
-    block_id: np.ndarray, assignment: dict[int, str], split: str,
-) -> np.ndarray:
-    """Bool mask: True where the pixel's block is assigned to `split`."""
-    target_blocks = {b for b, s in assignment.items() if s == split}
-    return np.isin(block_id, list(target_blocks))
 
 
 # ---------------------------------------------------------------------------
@@ -231,66 +216,94 @@ def build_spatial_mask(
 # ---------------------------------------------------------------------------
 
 class DownscalingDataset(Dataset):
-    """One sample per MODIS date in the split's temporal range, full scene."""
+    """Each sample = one (date, spatial-block) pair.
+
+    lr_lst is the full LR scene so the model retains global thermal context.
+    All HR tensors are cropped to the block.
+    """
 
     def __init__(
         self,
         root: str = "data",
         split: str = "train",
+        lr_res: str = "4km",
+        hr_res: str = "1km",
         lst_layer: str = "LST_Day_1km",
         download: bool = True,
         block_seed: int = 42,
         min_valid_frac: float = 0.05,
     ):
         assert split in SPLIT_RANGES, f"split must be in {list(SPLIT_RANGES)}"
+        assert lr_res in RESOLUTION_DEMS, f"lr_res must be one of {list(RESOLUTION_DEMS)}"
+        assert hr_res in RESOLUTION_DEMS, f"hr_res must be one of {list(RESOLUTION_DEMS)}"
         super().__init__()
         self.root = root
         self.split = split
+        self.lr_res = lr_res
+        self.hr_res = hr_res
         self.lst_layer = lst_layer
         self.min_valid_frac = min_valid_frac
 
         self.modis_dir = os.path.join(root, "MODIS")
-        self.ndvi_dir = os.path.join(root, "NDVI")
-        self.dem_dir = os.path.join(root, "DEM")
+        self.ndvi_dir  = os.path.join(root, "NDVI")
+        self.dem_dir   = os.path.join(root, "DEM")
         self.lulc_path = os.path.join(root, "LULC_final.tiff")
+        self.station_csv = os.path.join(root, "stations", "final_stations.csv")
 
         if download:
             self._download_if_missing()
 
-        # --- HR/LR reference grids from DEM tiffs ---
-        with rasterio.open(os.path.join(self.dem_dir, "dem_aoi_1km.tif")) as ds:
-            self.hr_shape = ds.shape
+        # --- HR grid ---
+        with rasterio.open(os.path.join(self.dem_dir, RESOLUTION_DEMS[hr_res])) as ds:
+            self.hr_shape     = ds.shape
             self.hr_transform = ds.transform
-            self.hr_crs = str(ds.crs)
-            dem_raw = ds.read(1).astype(np.float32)
-            dem_nodata = ds.nodata
+            self.hr_crs       = str(ds.crs)
+            dem_raw           = ds.read(1).astype(np.float32)
+            dem_nodata        = ds.nodata
         if dem_nodata is not None:
             dem_raw[dem_raw == dem_nodata] = np.nan
-        # Fill DEM NaNs with the spatial mean so models don't see sentinels.
         self.dem_hr = _fillna(dem_raw)
-        with rasterio.open(os.path.join(self.dem_dir, "dem_aoi_4km.tif")) as ds:
-            self.lr_shape = ds.shape
+
+        # --- LR grid ---
+        with rasterio.open(os.path.join(self.dem_dir, RESOLUTION_DEMS[lr_res])) as ds:
+            self.lr_shape     = ds.shape
             self.lr_transform = ds.transform
-            self.lr_crs = str(ds.crs)
+            self.lr_crs       = str(ds.crs)
 
         # --- Static covariates on HR grid ---
-        self.lulc_hr = self._load_lulc_hr()
-        # Sorted list of NLCD classes present in this AOI; defines one-hot order.
+        self.lulc_hr      = self._load_lulc_hr()
         self.lulc_classes = np.array(sorted(np.unique(self.lulc_hr).tolist()), dtype=np.int32)
 
-        # --- Spatial split mask ---
-        self.block_id = build_block_grid(self.hr_shape, BLOCK_GRID)
+        # --- Spatial split ---
+        self.block_id         = build_block_grid(self.hr_shape, BLOCK_GRID)
         self.block_assignment = assign_blocks_to_splits(
             self.block_id, self.lulc_hr, self.dem_hr, seed=block_seed,
         )
-        self.spatial_mask = build_spatial_mask(
-            self.block_id, self.block_assignment, split,
+        # Precompute bounding box of each block in HR pixel coords
+        self.block_bboxes = _compute_block_bboxes(self.block_id)
+        # Max block size — all crops are padded to this so the collator can stack them
+        self.block_h = max(r1 - r0 for r0, r1, c0, c1 in self.block_bboxes.values())
+        self.block_w = max(c1 - c0 for r0, r1, c0, c1 in self.block_bboxes.values())
+
+        # Blocks containing a station are dropped from training only
+        self.station_blocks = self._station_block_ids()
+
+        # Blocks belonging to this split — these are the sample atoms
+        self.split_blocks = sorted(
+            b for b, s in self.block_assignment.items()
+            if s == split and (split != "train" or b not in self.station_blocks)
         )
+
+        # spatial_mask is still needed for _filter_by_valid_frac
+        self._spatial_mask = np.isin(self.block_id, self.split_blocks)
+
+        # --- Location encoding: normalized UTM coords for every HR pixel ---
+        self.loc_x, self.loc_y = _build_location_encoding(self.hr_shape, self.hr_transform)
 
         # --- File indices ---
         self.ndvi_index = self._index_ndvi()
-        self.dates = self._index_modis_dates()
-        self.dates = self._filter_by_valid_frac(self.dates)
+        self.dates      = self._index_modis_dates()
+        self.dates      = self._filter_by_valid_frac(self.dates)
 
     # ------------------------------------------------------------------
     # Setup helpers
@@ -298,8 +311,9 @@ class DownscalingDataset(Dataset):
 
     def _download_if_missing(self) -> None:
         modis_files = glob.glob(os.path.join(self.modis_dir, "*_cropped.hdf"))
-        dem_files = glob.glob(os.path.join(self.dem_dir, "*.tif"))
-        if len(modis_files) > 100 and len(dem_files) >= 4:
+        dem_files   = glob.glob(os.path.join(self.dem_dir, "*.tif"))
+        ndvi_files  = glob.glob(os.path.join(self.ndvi_dir, "*_cropped.hdf"))
+        if len(modis_files) > 100 and len(dem_files) >= 4 and len(ndvi_files) > 0:
             return
         from huggingface_hub import snapshot_download
         snapshot_download(
@@ -309,7 +323,6 @@ class DownscalingDataset(Dataset):
         )
 
     def _load_lulc_hr(self) -> np.ndarray:
-        """Reproject LULC from native AEA 30 m → HR (1 km) UTM grid (mode)."""
         with rasterio.open(self.lulc_path) as src:
             lulc = np.full(self.hr_shape, LULC_NODATA, dtype=np.uint8)
             reproject(
@@ -321,12 +334,26 @@ class DownscalingDataset(Dataset):
                 dst_crs=self.hr_crs,
                 resampling=Resampling.mode,
             )
-        # Replace nodata with 0 (NLCD "Unclassified") so embeddings see a real class.
         lulc[lulc == LULC_NODATA] = 0
         return lulc
 
+    def _station_block_ids(self) -> set[int]:
+        if not os.path.exists(self.station_csv):
+            return set()
+        proj = Transformer.from_crs("EPSG:4326", self.hr_crs, always_xy=True)
+        blocks: set[int] = set()
+        with open(self.station_csv, newline="") as f:
+            for row in csv.DictReader(f):
+                lat = float(row["latitude"])
+                lon = float(row["longitude"])
+                x, y = proj.transform(lon, lat)
+                r, c = rowcol(self.hr_transform, x, y)
+                r, c = int(r), int(c)
+                if 0 <= r < self.hr_shape[0] and 0 <= c < self.hr_shape[1]:
+                    blocks.add(int(self.block_id[r, c]))
+        return blocks
+
     def _index_modis_dates(self) -> list[tuple[datetime, str]]:
-        """List (date, path) within this split's temporal range."""
         start, end = SPLIT_RANGES[self.split]
         out = []
         for f in sorted(glob.glob(os.path.join(self.modis_dir, "*_cropped.hdf"))):
@@ -336,29 +363,22 @@ class DownscalingDataset(Dataset):
         return out
 
     def _index_ndvi(self) -> list[tuple[datetime, str]]:
-        out = []
-        for f in sorted(glob.glob(os.path.join(self.ndvi_dir, "*_cropped.hdf"))):
-            out.append((_modis_date(f), f))
+        out = [(_modis_date(f), f)
+               for f in sorted(glob.glob(os.path.join(self.ndvi_dir, "*_cropped.hdf")))]
         return sorted(out)
 
     def _filter_by_valid_frac(
         self, dates: list[tuple[datetime, str]],
     ) -> list[tuple[datetime, str]]:
-        """Drop scenes where < min_valid_frac of this split's pixels have valid LST.
-
-        Reads only the small native (77×59) raw LST + QC arrays, so this is cheap.
-        """
         if self.min_valid_frac <= 0:
             return dates
         kept = []
         for d, path in dates:
             lst, tf = read_modis_lst(path, self.lst_layer)
-            hr = reproject_to(
-                lst, tf, REF_CRS, self.hr_shape, self.hr_transform,
-                resampling=Resampling.bilinear,
-            )
-            valid = np.isfinite(hr) & self.spatial_mask
-            frac = valid.sum() / max(self.spatial_mask.sum(), 1)
+            hr = reproject_to(lst, tf, REF_CRS, self.hr_shape, self.hr_transform,
+                               resampling=Resampling.bilinear)
+            valid = np.isfinite(hr) & self._spatial_mask
+            frac  = valid.sum() / max(self._spatial_mask.sum(), 1)
             if frac >= self.min_valid_frac:
                 kept.append((d, path))
         return kept
@@ -368,71 +388,114 @@ class DownscalingDataset(Dataset):
             raise RuntimeError("No NDVI files found")
         dates = [d for d, _ in self.ndvi_index]
         i = bisect.bisect_left(dates, target)
-        cand = []
-        if i < len(dates):
-            cand.append(i)
-        if i > 0:
-            cand.append(i - 1)
+        cand = [j for j in (i, i - 1) if 0 <= j < len(dates)]
         best = min(cand, key=lambda j: abs((dates[j] - target).days))
         return self.ndvi_index[best][1]
 
     @lru_cache(maxsize=64)
     def _ndvi_hr(self, ndvi_path: str) -> np.ndarray:
         ndvi, tf = read_ndvi(ndvi_path)
-        return reproject_to(
-            ndvi, tf, REF_CRS, self.hr_shape, self.hr_transform,
-            resampling=Resampling.bilinear,
-        )
+        return reproject_to(ndvi, tf, REF_CRS, self.hr_shape, self.hr_transform,
+                             resampling=Resampling.bilinear)
 
     # ------------------------------------------------------------------
     # PyTorch interface
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
-        return len(self.dates)
+        return len(self.dates) * len(self.split_blocks)
 
     def __getitem__(self, idx: int) -> dict:
-        date, modis_path = self.dates[idx]
+        date_idx  = idx // len(self.split_blocks)
+        block_idx = idx %  len(self.split_blocks)
+        block_id  = self.split_blocks[block_idx]
+        r0, r1, c0, c1 = self.block_bboxes[block_id]
+
+        date, modis_path = self.dates[date_idx]
         lst_native, tf = read_modis_lst(modis_path, self.lst_layer)
 
-        hr_lst = reproject_to(
-            lst_native, tf, REF_CRS, self.hr_shape, self.hr_transform,
-            resampling=Resampling.bilinear,
-        )
-        lr_lst = reproject_to(
-            lst_native, tf, REF_CRS, self.lr_shape, self.lr_transform,
-            resampling=Resampling.average,
-        )
-        ndvi_hr = self._ndvi_hr(self._nearest_ndvi(date))
+        # Full LR scene — gives the model global thermal context
+        lr_lst = reproject_to(lst_native, tf, REF_CRS, self.lr_shape, self.lr_transform,
+                               resampling=Resampling.average)
 
-        data_mask = np.isfinite(hr_lst)
-        valid = data_mask & self.spatial_mask
+        # HR scene cropped to this block
+        hr_lst_full = reproject_to(lst_native, tf, REF_CRS, self.hr_shape, self.hr_transform,
+                                    resampling=Resampling.bilinear)
+        hr_block = hr_lst_full[r0:r1, c0:c1]
 
-        # One-hot encode LULC against AOI-present classes (broadcasted equality).
-        lulc_oh = (self.lulc_hr[None, ...] == self.lulc_classes[:, None, None]).astype(np.float32)
+        ndvi_block = self._ndvi_hr(self._nearest_ndvi(date))[r0:r1, c0:c1]
 
+        data_mask = np.isfinite(hr_block)
+        valid     = data_mask
+
+        lulc_block = self.lulc_hr[r0:r1, c0:c1]
+        lulc_oh    = (lulc_block[None] == self.lulc_classes[:, None, None]).astype(np.float32)
+
+        loc = np.stack([self.loc_x[r0:r1, c0:c1], self.loc_y[r0:r1, c0:c1]])  # (2, bH, bW)
+
+        # Pad to max block size so all samples collate to the same shape.
+        # valid_mask is False for padded pixels so they never enter the loss.
+        H, W = self.block_h, self.block_w
         return {
             "lr_lst":      torch.from_numpy(_fillna(lr_lst)).unsqueeze(0),
-            "hr_lst":      torch.from_numpy(_fillna(hr_lst)).unsqueeze(0),
-            "ndvi":        torch.from_numpy(_fillna(ndvi_hr, fill=0.0)).unsqueeze(0),
-            "dem":         torch.from_numpy(self.dem_hr).unsqueeze(0),
-            "lulc":        torch.from_numpy(self.lulc_hr.astype(np.int64)).unsqueeze(0),
-            "lulc_onehot": torch.from_numpy(lulc_oh),
-            "data_mask":   torch.from_numpy(data_mask).unsqueeze(0),
-            "valid_mask":  torch.from_numpy(valid).unsqueeze(0),
+            "hr_lst":      torch.from_numpy(_pad2d(_fillna(hr_block), H, W)).unsqueeze(0),
+            "ndvi":        torch.from_numpy(_pad2d(_fillna(ndvi_block, fill=0.0), H, W)).unsqueeze(0),
+            "dem":         torch.from_numpy(_pad2d(self.dem_hr[r0:r1, c0:c1], H, W)).unsqueeze(0),
+            "lulc":        torch.from_numpy(_pad2d(lulc_block.astype(np.int64), H, W)).unsqueeze(0),
+            "lulc_onehot": torch.from_numpy(_pad2d(lulc_oh, H, W)),
+            "loc":         torch.from_numpy(_pad2d(loc, H, W)),
+            "data_mask":   torch.from_numpy(_pad2d(data_mask, H, W)).unsqueeze(0),
+            "valid_mask":  torch.from_numpy(_pad2d(valid, H, W)).unsqueeze(0),
             "date":        date.strftime("%Y-%m-%d"),
+            "block_id":    block_id,
         }
 
 
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def _pad2d(arr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    """Pad the last two dimensions of `arr` to (target_h, target_w) with zeros."""
+    ph = target_h - arr.shape[-2]
+    pw = target_w - arr.shape[-1]
+    if ph == 0 and pw == 0:
+        return arr
+    pad = [(0, 0)] * (arr.ndim - 2) + [(0, ph), (0, pw)]
+    return np.pad(arr, pad)
+
+
+def _compute_block_bboxes(block_id: np.ndarray) -> dict[int, tuple[int, int, int, int]]:
+    n_blocks = int(block_id.max()) + 1
+    bboxes = {}
+    for b in range(n_blocks):
+        m    = block_id == b
+        rows = np.where(m.any(axis=1))[0]
+        cols = np.where(m.any(axis=0))[0]
+        bboxes[b] = (int(rows[0]), int(rows[-1]) + 1,
+                     int(cols[0]), int(cols[-1]) + 1)
+    return bboxes
+
+
+def _build_location_encoding(
+    hr_shape: tuple[int, int], hr_transform: Affine,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Normalized UTM pixel-center coordinates in [0, 1] over the AOI."""
+    H, W = hr_shape
+    tf   = hr_transform
+    xs   = tf.c + (np.arange(W, dtype=np.float64) + 0.5) * tf.a   # easting
+    ys   = tf.f + (np.arange(H, dtype=np.float64) + 0.5) * tf.e   # northing (e < 0)
+    xx, yy = np.meshgrid(xs, ys)
+    x_norm = ((xx - xx.min()) / (xx.max() - xx.min())).astype(np.float32)
+    y_norm = ((yy - yy.min()) / (yy.max() - yy.min())).astype(np.float32)
+    return x_norm, y_norm
+
+
 def _fillna(arr: np.ndarray, fill: float | None = None) -> np.ndarray:
-    """Replace NaNs with `fill` (default = nanmean of array, 0 if all NaN)."""
-    arr = arr.astype(np.float32, copy=True)
+    arr  = arr.astype(np.float32, copy=True)
     mask = ~np.isfinite(arr)
     if mask.any():
-        if fill is None:
-            v = float(np.nanmean(arr)) if np.isfinite(arr).any() else 0.0
-        else:
-            v = fill
+        v = (float(np.nanmean(arr)) if np.isfinite(arr).any() else 0.0) if fill is None else fill
         arr[mask] = v
     return arr
 
@@ -446,12 +509,16 @@ def get_dataloaders(
     batch_size: int = 8,
     num_workers: int = 0,
     download: bool = True,
+    lr_res: str = "4km",
+    hr_res: str = "1km",
     **dataset_kwargs,
 ) -> dict[str, DataLoader]:
     loaders = {}
     for split in ("train", "val", "test"):
-        ds = DownscalingDataset(root=root, split=split, download=download,
-                                **dataset_kwargs)
+        ds = DownscalingDataset(
+            root=root, split=split, lr_res=lr_res, hr_res=hr_res,
+            download=download, **dataset_kwargs,
+        )
         loaders[split] = DataLoader(
             ds,
             batch_size=batch_size,
