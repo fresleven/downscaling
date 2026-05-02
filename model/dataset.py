@@ -114,7 +114,7 @@ def _read_h5_layer(path: str, layer: str) -> tuple[np.ndarray, Affine, str]:
 
 def read_modis_lst(path: str, layer: str = "LST_Day_1km") -> tuple[np.ndarray, Affine]:
     raw, tf, _ = _read_h5_layer(path, layer)
-    valid = (raw >= 7500) & (raw <= 65535)  # MODIS fill-value mask only
+    valid = raw != 0  # fill value is 0; all non-zero DN are valid temperatures
     lst = np.where(valid, raw.astype(np.float32) * 0.02 - 273.15, np.nan)
     return lst.astype(np.float32), tf
 
