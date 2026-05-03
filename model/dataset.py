@@ -21,7 +21,7 @@ interpolated from 1 km — not a true 250 m measurement. Swap in Landsat/ASTER
 thermal data when you have it.
 
 Each sample is one (date, spatial-block) pair:
-    lr_lst       (1, LR_H, LR_W)   full LR scene at lr_res
+    lr_lst       (1, lH, lW)        LR block (same geographic area as HR block, at lr_res)
     hr_lst       (1, bH, bW)        HR target cropped to this block at hr_res
     ndvi         (1, bH, bW)        nearest NDVI composite, reprojected to hr_res
     dem          (1, bH, bW)        static DEM at hr_res
@@ -218,8 +218,9 @@ def assign_blocks_to_splits(
 class DownscalingDataset(Dataset):
     """Each sample = one (date, spatial-block) pair.
 
-    lr_lst is the full LR scene so the model retains global thermal context.
-    All HR tensors are cropped to the block.
+    lr_lst is the bicubic-upsampled LR scene cropped to the block (same spatial
+    extent as hr_lst). The model predicts a residual on top of this bicubic baseline.
+    All HR tensors are cropped and padded to (block_h, block_w).
     """
 
     def __init__(
@@ -284,6 +285,13 @@ class DownscalingDataset(Dataset):
         # Max block size — all crops are padded to this so the collator can stack them
         self.block_h = max(r1 - r0 for r0, r1, c0, c1 in self.block_bboxes.values())
         self.block_w = max(c1 - c0 for r0, r1, c0, c1 in self.block_bboxes.values())
+
+        # LR block bboxes — same geographic area as each HR block, in LR pixel coords
+        self.lr_block_bboxes = _compute_lr_block_bboxes(
+            self.block_bboxes, self.hr_transform, self.lr_transform, self.lr_shape,
+        )
+        self.lr_block_h = max(r1 - r0 for r0, r1, c0, c1 in self.lr_block_bboxes.values())
+        self.lr_block_w = max(c1 - c0 for r0, r1, c0, c1 in self.lr_block_bboxes.values())
 
         # Blocks containing a station are dropped from training only
         self.station_blocks = self._station_block_ids()
@@ -414,9 +422,11 @@ class DownscalingDataset(Dataset):
         date, modis_path = self.dates[date_idx]
         lst_native, tf = read_modis_lst(modis_path, self.lst_layer)
 
-        # Full LR scene — gives the model global thermal context
-        lr_lst = reproject_to(lst_native, tf, REF_CRS, self.lr_shape, self.lr_transform,
-                               resampling=Resampling.average)
+        # LR block: reproject to LR grid, crop to same geographic area as HR block
+        lr_full = reproject_to(lst_native, tf, REF_CRS, self.lr_shape, self.lr_transform,
+                                resampling=Resampling.average)
+        lr0, lr1, lc0, lc1 = self.lr_block_bboxes[block_id]
+        lr_block = lr_full[lr0:lr1, lc0:lc1]
 
         # HR scene cropped to this block
         hr_lst_full = reproject_to(lst_native, tf, REF_CRS, self.hr_shape, self.hr_transform,
@@ -425,19 +435,35 @@ class DownscalingDataset(Dataset):
 
         ndvi_block = self._ndvi_hr(self._nearest_ndvi(date))[r0:r1, c0:c1]
 
-        data_mask = np.isfinite(hr_block)
-        valid     = data_mask
+        data_mask    = np.isfinite(hr_block)
+        lr_data_mask = np.isfinite(lr_block).astype(np.float32)  # 1 = valid LR pixel, 0 = cloud
+        valid        = data_mask
 
         lulc_block = self.lulc_hr[r0:r1, c0:c1]
         lulc_oh    = (lulc_block[None] == self.lulc_classes[:, None, None]).astype(np.float32)
 
         loc = np.stack([self.loc_x[r0:r1, c0:c1], self.loc_y[r0:r1, c0:c1]])  # (2, bH, bW)
 
+        # Bicubic baseline at the CORRECT (lrH,lrW)→(bH,bW) scale, computed before
+        # padding. Doing this here avoids the scale distortion that occurs when the
+        # model upsamples a zero-padded LR crop to a zero-padded HR size — those two
+        # padding amounts differ, so the inferred scale is wrong (e.g. 3.83× instead
+        # of 4.4×), corrupting the baseline that the delta is trained against.
+        bH, bW = r1 - r0, c1 - c0
+        lr_filled = _fillna(lr_block)
+        _lr_t  = torch.from_numpy(lr_filled).unsqueeze(0).unsqueeze(0)  # (1,1,lrH,lrW)
+        _base  = torch.nn.functional.interpolate(
+            _lr_t, size=(bH, bW), mode="bicubic", align_corners=False
+        ).squeeze(0).squeeze(0).numpy().astype(np.float32)              # (bH, bW)
+
         # Pad to max block size so all samples collate to the same shape.
         # valid_mask is False for padded pixels so they never enter the loss.
         H, W = self.block_h, self.block_w
+        LH, LW = self.lr_block_h, self.lr_block_w
         return {
-            "lr_lst":      torch.from_numpy(_fillna(lr_lst)).unsqueeze(0),
+            "lr_lst":      torch.from_numpy(_pad2d(lr_filled, LH, LW)).unsqueeze(0),
+            "lr_mask":     torch.from_numpy(_pad2d(lr_data_mask, LH, LW)).unsqueeze(0),
+            "lr_bicubic":  torch.from_numpy(_pad2d(_base, H, W)).unsqueeze(0),
             "hr_lst":      torch.from_numpy(_pad2d(_fillna(hr_block), H, W)).unsqueeze(0),
             "ndvi":        torch.from_numpy(_pad2d(_fillna(ndvi_block, fill=0.0), H, W)).unsqueeze(0),
             "dem":         torch.from_numpy(_pad2d(self.dem_hr[r0:r1, c0:c1], H, W)).unsqueeze(0),
@@ -463,6 +489,33 @@ def _pad2d(arr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
         return arr
     pad = [(0, 0)] * (arr.ndim - 2) + [(0, ph), (0, pw)]
     return np.pad(arr, pad)
+
+
+def _compute_lr_block_bboxes(
+    hr_bboxes: dict[int, tuple[int, int, int, int]],
+    hr_transform: Affine,
+    lr_transform: Affine,
+    lr_shape: tuple[int, int],
+) -> dict[int, tuple[int, int, int, int]]:
+    """For each HR block bbox, return the corresponding bbox in LR pixel coords."""
+    bboxes = {}
+    for b, (r0h, r1h, c0h, c1h) in hr_bboxes.items():
+        # Geographic edges of the HR block
+        x_min = hr_transform.c + c0h * hr_transform.a
+        x_max = hr_transform.c + c1h * hr_transform.a
+        y_max = hr_transform.f + r0h * hr_transform.e   # e < 0, so small row = large y
+        y_min = hr_transform.f + r1h * hr_transform.e
+        # Convert to LR pixel indices (floor start, ceil end for full coverage)
+        c0l = int(np.floor((x_min - lr_transform.c) / lr_transform.a))
+        c1l = int(np.ceil( (x_max - lr_transform.c) / lr_transform.a))
+        r0l = int(np.floor((y_max - lr_transform.f) / lr_transform.e))
+        r1l = int(np.ceil( (y_min - lr_transform.f) / lr_transform.e))
+        # Clamp to valid grid
+        r0l = max(0, r0l); c0l = max(0, c0l)
+        r1l = min(lr_shape[0], max(r0l + 1, r1l))
+        c1l = min(lr_shape[1], max(c0l + 1, c1l))
+        bboxes[b] = (r0l, r1l, c0l, c1l)
+    return bboxes
 
 
 def _compute_block_bboxes(block_id: np.ndarray) -> dict[int, tuple[int, int, int, int]]:
